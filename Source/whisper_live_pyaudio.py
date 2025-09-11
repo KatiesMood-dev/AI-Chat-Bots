@@ -18,19 +18,18 @@ import numpy as np
 import pyaudio
 import torch
 import whisper
-import lmstudio as lms
-
+import webrtcvad
+import queue
 
 # ------------------- Configuration ------------------------------------
 CHUNK = 1024                # Number of frames per PyAudio read
 FORMAT = pyaudio.paInt16    # 16‑bit int PCM (same as Whisper expects)
 CHANNELS = 1                # Mono
 RATE = 24000                # 16 kHz – required by Whisper
+VAD_RATE = 16000            # VAD requires 16 kHz
 WHISPER_MODEL = "large"     # tiny, base, small, medium, large, large-v2, large-v3
 
-# How many seconds of audio we accumulate before decoding.
-SEGMENT_SECONDS = 10
-# OVERLAP_SECONDS = 1
+SEGMENT_SECONDS = 10        # How many seconds of audio we accumulate before decoding.
 DEBUG = True
 
 OUTPUT_FILE = "D:/My Projects/AI-Chat-Bots/Source/STT_Log.txt"
@@ -65,6 +64,37 @@ def transcription_thread(buffer):
 
     # Reset buffer for next segment
 
+# -----------------------------------------------------------------------
+
+def downsample_to_16k(audio_chunk, orig_rate=RATE, target_rate=VAD_RATE):
+    """Downsample numpy int16 audio to 16kHz for VAD."""
+    if orig_rate == target_rate:
+        return audio_chunk
+    ratio = orig_rate / target_rate
+    indices = np.round(np.arange(0, len(audio_chunk), ratio)).astype(int)
+    indices = indices[indices < len(audio_chunk)]
+    return audio_chunk[indices]
+
+# -----------------------------------------------------------------------
+
+def vad_worker(vad, audio_queue, buffer_queue):
+    """Background thread: consume audio chunks, run VAD, and forward speech chunks."""
+    while True:
+        audio_chunk = audio_queue.get()
+        if audio_chunk is None:
+            break
+
+        # Downsample for VAD check
+        vad_chunk = downsample_to_16k(audio_chunk)
+
+        # Only check one 30ms frame (fast!)
+        frame_length = int(VAD_RATE * 0.03)  # 30 ms
+        if len(vad_chunk) >= frame_length:
+            frame = vad_chunk[:frame_length].tobytes()
+            if vad.is_speech(frame, sample_rate=VAD_RATE):
+                buffer_queue.put(audio_chunk)
+
+# -----------------------------------------------------------------------
 
 def main():
     if os.path.isfile(OUTPUT_FILE):
@@ -90,32 +120,44 @@ def main():
         print(f"Could not open microphone: {e}")
         sys.exit(1)
 
+    # Init WebRTC VAD
+    vad = webrtcvad.Vad()
+    vad.set_mode(2)
 
+    # Queues for thread comms
+    audio_queue = queue.Queue()
+    buffer_queue = queue.Queue()
 
-    # Graceful shutdown flag
-    running = True
+    # Start VAD thread
+    threading.Thread(target=vad_worker, args=(vad, audio_queue, buffer_queue), daemon=True).start()
 
-    print("Listening… Press Ctrl-C to exit.")
-    
-    # Read a chunk from the mic
     buffer = np.array([], dtype=np.int16)
 
     while True:
         try:
             data = stream.read(CHUNK, exception_on_overflow=False)
             audio_chunk = np.frombuffer(data, dtype=np.int16)
-            buffer = np.concatenate((buffer, audio_chunk))
 
-            # print(f"[{time.strftime('%H:%M:%S')}] {buffer.shape[0]}")
+            # Push raw audio to VAD worker
+            audio_queue.put(audio_chunk)
 
-            # When we have enough samples for SEGMENT_SECONDS seconds,
-            # decode and clear the buffer.
+            # Collect any speech chunks
+            while not buffer_queue.empty():
+                buffer = np.concatenate((buffer, buffer_queue.get()))
 
+            # Does not mean we transcribe every SEGMENT_SECONDS seconds
+            # VAD thread filters out chunks of silence so this waits for SEGMENT_SECONDS seconds of actual speech.
             if len(buffer) >= RATE * SEGMENT_SECONDS:
-                threading.Thread(target=transcription_thread, args=(np.copy(buffer),), daemon=True).start()
+                threading.Thread(target=transcription_thread,
+                                 args=(np.copy(buffer),),
+                                 daemon=True).start()
                 buffer = np.array([], dtype=np.int16)
-        except KeyboardInterrupt as e:
+
+        except KeyboardInterrupt:
             break
+
+    # Signal VAD thread to stop
+    audio_queue.put(None)
 
 
     # Clean up
