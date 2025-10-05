@@ -29,10 +29,10 @@ RATE = 24000                # 16 kHz – required by Whisper
 VAD_RATE = 16000            # VAD requires 16 kHz
 WHISPER_MODEL = "large"     # tiny, base, small, medium, large, large-v2, large-v3
 
-SEGMENT_SECONDS = 10        # How many seconds of audio we accumulate before decoding.
-DEBUG = True
+SEGMENT_SECONDS = 5        # How many seconds of audio we accumulate before decoding.
+DEBUG = False
 
-OUTPUT_FILE = "D:/My Projects/AI-Chat-Bots/Source/STT_Log.txt"
+OUTPUT_FILE = "D:/My Projects/AI-Chat-Bots/Source/mic_transcript.txt"
 
 # -----------------------------------------------------------------------
 
@@ -55,11 +55,15 @@ def transcription_thread(buffer):
         stream_out.close()
 
     # Whisper expects a numpy array of shape (n_samples,)
-    result = model.transcribe(audio_float,
-                              fp16=True if torch.cuda.is_available() else False,
-                              language="en")  # Change if needed
+    try:
+        result = model.transcribe(audio_float,
+                                  fp16=True if torch.cuda.is_available() else False,
+                                  language="en")  # Change if needed
+    except Exception as e:
+        print(f"Transcription encountered error: {e}")
+
     with open(OUTPUT_FILE, "a") as f:
-        f.write(f"[CONFIDENCE] {result} [TEXT] {result['text']}\n")
+        f.write(f"{result['text']}\n")
     print(f"[{time.strftime('%H:%M:%S')}] {result['text']}")
 
     # Reset buffer for next segment
@@ -104,7 +108,8 @@ def main():
     print(f"Loading Whisper '{WHISPER_MODEL}' model…")
     global model
     model = whisper.load_model(WHISPER_MODEL, device="cuda" if torch.cuda.is_available() else "cpu")
-
+    
+    print(f"Now listening!")
     # Set up PyAudio
     pa = pyaudio.PyAudio()
     try:
@@ -113,9 +118,7 @@ def main():
                          channels=CHANNELS,
                          rate=RATE,
                          input=True,
-                         frames_per_buffer=CHUNK)
-    
-        
+                         frames_per_buffer=CHUNK)      
     except Exception as e:
         print(f"Could not open microphone: {e}")
         sys.exit(1)
